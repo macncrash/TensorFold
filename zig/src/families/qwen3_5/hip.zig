@@ -47,6 +47,7 @@ test {
     _ = hip_lanes;
     _ = radix;
     _ = native_engine;
+    _ = worker;
     _ = pages;
     _ = plan;
     _ = slicing;

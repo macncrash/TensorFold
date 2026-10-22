@@ -18,6 +18,12 @@ const max_windows = 128;
 
 const Fill = struct { prompt: []u32, at: usize };
 
+/// Words [at, at + n) of a message; one shorter than its own counts say is refused, not read past.
+fn words(m: []const u32, at: usize, n: usize) ![]const u32 {
+    if (at > m.len or n > m.len - at) return error.BadMessage;
+    return m[at..][0..n];
+}
+
 const Lane = struct {
     caches: state.Caches,
     /// Slots written and kept: the next window starts here.
@@ -64,6 +70,7 @@ pub const Worker = struct {
     }
 
     fn prefill(w: *Worker, id: u32, total: usize, prompt: []const u32, at: usize, snap: ?u32, held: []const u32) !void {
+        for (held) |page| if (page >= w.e.pool.count) return error.BadMessage;
         const gop = try w.lanes.getOrPut(w.gpa, id);
         if (gop.found_existing) w.destroy(gop.value_ptr.*);
         errdefer w.lanes.removeByPtr(gop.key_ptr);
@@ -81,6 +88,7 @@ pub const Worker = struct {
     fn fill(w: *Worker, id: u32, to: usize) !void {
         const lane = w.lanes.get(id) orelse return error.UnknownStream;
         const f = &(lane.fill orelse return error.NoPromptPass);
+        if (to < f.at or to > f.prompt.len) return error.BadMessage;
         if (to == f.prompt.len) {
             _ = try w.e.prefill(&lane.caches, f.prompt, f.at, null, w.reqs[0], null);
             w.gpa.free(f.prompt);
@@ -98,6 +106,7 @@ pub const Worker = struct {
     fn verify(w: *Worker, ids: []const u32, rows: []const Engine.Rows, pick: Pick) !void {
         var total: usize = 0;
         for (rows) |r| total += r.tokens.len;
+        if (total > w.reqs.len) return error.BadMessage;
         _ = try w.e.choose(rows, pick);
         _ = try w.e.verify(rows, w.reqs[0..total], w.out[0..total]);
         for (ids, 0..) |id, i| w.lanes.get(id).?.pending = .{ .window = i, .rows = rows[i].tokens.len };
@@ -106,9 +115,18 @@ pub const Worker = struct {
     fn keep(w: *Worker, id: u32, rows: usize) !void {
         const lane = w.lanes.get(id) orelse return error.UnknownStream;
         const p = lane.pending orelse return error.NothingToKeep;
+        if (rows > p.rows) return error.BadMessage;
         w.e.keep(p.window, rows);
         lane.len += rows;
         lane.pending = null;
+    }
+
+    /// The stream's page table from index `first` on: within the table, and every page in the pool.
+    fn pages(w: *Worker, id: u32, first: usize, ids: []const u32) !void {
+        const caches = &(try w.laneOf(id)).caches;
+        if (first > caches.table.items.len) return error.BadMessage;
+        for (ids) |page| if (page >= w.e.pool.count) return error.BadMessage;
+        try caches.set(w.gpa, first, ids);
     }
 
     fn release(w: *Worker, id: u32) void {
@@ -126,44 +144,71 @@ pub const Worker = struct {
         while (true) {
             try link.recv(w.gpa, &msg);
             const m = msg.items;
-            switch (@as(Op, @fromBackingInt(@as(u32, @intCast(m[0]))))) {
+            if (m.len == 0) return error.BadMessage;
+            switch (std.enums.fromInt(Op, m[0]) orelse return error.BadMessage) {
                 .stop => return,
                 // prefill: id, positions, prompt len, resumed at, cut count, snapshot slot, page count, then the pages
                 .prefill => {
-                    const held = m[8..][0..m[7]];
+                    const head = try words(m, 0, 8);
+                    const held = try words(m, 8, head[7]);
                     // the cuts sit between the pages and the prompt
-                    const prompt = m[8 + m[7] + m[5] ..][0..m[3]];
-                    try w.prefill(m[1], m[2], prompt, m[4], if (m[6] == no_snapshot) null else m[6], held);
+                    const prompt = try words(m, 8 + @as(usize, head[7]) + head[5], head[3]);
+                    try w.prefill(head[1], head[2], prompt, head[4], if (head[6] == no_snapshot) null else head[6], held);
                 },
                 // verify: graph pick, count, then id, rows, tokens each; every rank derives the plan shape from them
                 .verify => {
-                    const pick: Pick = @fromBackingInt(m[1]);
-                    const n = m[2];
+                    const head = try words(m, 0, 3);
+                    const pick = std.enums.fromInt(Pick, head[1]) orelse return error.BadMessage;
+                    const n = head[2];
                     if (n > max_windows) return error.WindowTooWide;
                     var at: usize = 3;
                     for (0..n) |i| {
-                        const lane = w.lanes.get(m[at]) orelse return error.UnknownStream;
-                        ids[i] = m[at];
-                        rows[i] = .{ .caches = &lane.caches, .pos = lane.len, .tokens = m[at + 2 ..][0..m[at + 1]] };
-                        at += 2 + m[at + 1];
+                        const window = try words(m, at, 2);
+                        const lane = w.lanes.get(window[0]) orelse return error.UnknownStream;
+                        ids[i] = window[0];
+                        rows[i] = .{ .caches = &lane.caches, .pos = lane.len, .tokens = try words(m, at + 2, window[1]) };
+                        at += 2 + window[1];
                     }
                     try w.verify(ids[0..n], rows[0..n], pick);
                 },
                 // keep: count, then id and rows each
                 .keep => {
-                    for (0..m[1]) |i| try w.keep(m[2 + 2 * i], m[3 + 2 * i]);
+                    const n = (try words(m, 0, 2))[1];
+                    const kept = try words(m, 2, 2 * @as(usize, n));
+                    for (0..n) |i| try w.keep(kept[2 * i], kept[2 * i + 1]);
                     try w.e.flush();
                 },
-                .release => w.release(m[1]),
+                .release => w.release((try words(m, 0, 2))[1]),
                 // fill: id, end of the prompt pass's next chunk
-                .fill => try w.fill(m[1], m[2]),
+                .fill => {
+                    const head = try words(m, 0, 3);
+                    try w.fill(head[1], head[2]);
+                },
                 // pages: id, first page index, count, then the stream's table from that index on
-                .pages => try (try w.laneOf(m[1])).caches.set(w.gpa, m[2], m[4..][0..m[3]]),
+                .pages => {
+                    const head = try words(m, 0, 4);
+                    try w.pages(head[1], head[2], try words(m, 4, head[3]));
+                },
                 // snap: id, slot that keeps the stream's linear state
-                .snap => try w.snaps.take(m[2], &(try w.laneOf(m[1])).caches, w.e.stream.handle),
+                .snap => {
+                    const head = try words(m, 0, 3);
+                    try w.snaps.take(head[2], &(try w.laneOf(head[1])).caches, w.e.stream.handle);
+                },
                 // copy: from, to; page `to` becomes a copy of page `from`
-                .copy => try w.e.pool.copyPage(m[1], m[2], w.e.stream.handle),
+                .copy => {
+                    const head = try words(m, 0, 3);
+                    try w.e.pool.copyPage(head[1], head[2], w.e.stream.handle);
+                },
             }
         }
     }
 };
+
+test "a message shorter than its counts is refused" {
+    const m = [_]u32{ 1, 2, 3 };
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3 }, try words(&m, 1, 2));
+    try std.testing.expectEqualSlices(u32, &.{}, try words(&m, 3, 0));
+    try std.testing.expectError(error.BadMessage, words(&m, 2, 2));
+    try std.testing.expectError(error.BadMessage, words(&m, 4, 0));
+    try std.testing.expectError(error.BadMessage, words(&m, 1, std.math.maxInt(usize)));
+}
