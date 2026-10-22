@@ -75,12 +75,12 @@ fn defaultFull() std.StaticBitSet(128) {
     return s;
 }
 
-/// The text_config of a Kimi K3 config.json; unknown or vision fields are ignored.
+/// The text_config of a Kimi K3 config.json; unknown or vision fields are ignored, and a field of the wrong type or range is refused.
 pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
-    const root = parsed.value.object;
-    const t = (root.get("text_config") orelse parsed.value).object;
+    const root = try object(parsed.value);
+    const t = try object(root.get("text_config") orelse parsed.value);
     var c = Config{};
     const ints = .{
         .{ "hidden_size", "hidden" },               .{ "num_hidden_layers", "layers" },
@@ -93,31 +93,52 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
         .{ "v_head_dim", "v_dim" },                 .{ "attn_res_block_size", "block" },
     };
     inline for (ints) |p| if (t.get(p[0])) |v| {
-        @field(c, p[1]) = @intCast(v.integer);
+        @field(c, p[1]) = try int(v);
     };
     const floats = .{
         .{ "rms_norm_eps", "eps" },                        .{ "activation_situ_beta", "situ_beta" },
         .{ "activation_situ_linear_beta", "situ_linear" }, .{ "routed_scaling_factor", "routed_scale" },
     };
     inline for (floats) |p| if (t.get(p[0])) |v| {
-        @field(c, p[1]) = @floatCast(switch (v) {
-            .float => |f| f,
-            .integer => |i| @as(f64, @floatFromInt(i)),
-            else => return error.BadConfig,
-        });
+        @field(c, p[1]) = try float(v);
     };
-    c.shared_inter = c.moe_inter * @as(u32, @intCast(if (t.get("num_shared_experts")) |v| v.integer else 0));
+    const shared = if (t.get("num_shared_experts")) |v| try int(v) else 0;
+    c.shared_inter = std.math.mul(u32, c.moe_inter, shared) catch return error.BadConfig;
     if (t.get("linear_attn_config")) |la| {
-        const o = la.object;
-        c.kda_heads = @intCast(o.get("num_heads").?.integer);
-        c.kda_dim = @intCast(o.get("head_dim").?.integer);
-        c.conv = @intCast(o.get("short_conv_kernel_size").?.integer);
-        if (o.get("gate_lower_bound")) |v| c.lower_bound = @floatCast(v.float);
+        const o = try object(la);
+        c.kda_heads = try int(o.get("num_heads") orelse return error.BadConfig);
+        c.kda_dim = try int(o.get("head_dim") orelse return error.BadConfig);
+        c.conv = try int(o.get("short_conv_kernel_size") orelse return error.BadConfig);
+        if (o.get("gate_lower_bound")) |v| c.lower_bound = try float(v);
+        const full = o.get("full_attn_layers") orelse return error.BadConfig;
+        if (full != .array) return error.BadConfig;
         c.full_attn = std.StaticBitSet(128).empty;
-        for (o.get("full_attn_layers").?.array.items) |v| c.full_attn.set(@intCast(v.integer - 1));
+        // 1-based layer numbers, each a layer the bit set holds
+        for (full.array.items) |v| {
+            const layer = try int(v);
+            if (layer == 0 or layer > c.full_attn.capacity()) return error.BadConfig;
+            c.full_attn.set(layer - 1);
+        }
     }
     if (c.layers > 128) return error.TooManyLayers;
     return c;
+}
+
+fn object(v: std.json.Value) !std.json.ObjectMap {
+    return if (v == .object) v.object else error.BadConfig;
+}
+
+fn int(v: std.json.Value) !u32 {
+    if (v != .integer) return error.BadConfig;
+    return std.math.cast(u32, v.integer) orelse error.BadConfig;
+}
+
+fn float(v: std.json.Value) !f32 {
+    return @floatCast(switch (v) {
+        .float => |f| f,
+        .integer => |i| @as(f64, @floatFromInt(i)),
+        else => return error.BadConfig,
+    });
 }
 
 test "K3's defaults: 69 KDA and 24 MLA layers, layer 0 KDA, layers 3 and 92 MLA" {
@@ -130,4 +151,31 @@ test "K3's defaults: 69 KDA and 24 MLA layers, layer 0 KDA, layers 3 and 92 MLA"
     try std.testing.expectEqual(Kind.mla, c.kind(91));
     try std.testing.expectEqual(@as(u32, 23), c.kindIndex(92));
     try std.testing.expectEqual(@as(u32, 8), c.blocksBefore(85));
+}
+
+test "a config field of the wrong type or range is refused" {
+    const a = std.testing.allocator;
+    const c = try parse(a,
+        \\{"text_config": {"num_hidden_layers": 4, "moe_intermediate_size": 8, "num_shared_experts": 2,
+        \\ "linear_attn_config": {"num_heads": 2, "head_dim": 4, "short_conv_kernel_size": 4, "gate_lower_bound": -5, "full_attn_layers": [2, 128]}}}
+    );
+    try std.testing.expectEqual(@as(u32, 16), c.shared_inter);
+    try std.testing.expectEqual(Kind.mla, c.kind(1));
+    try std.testing.expectEqual(Kind.mla, c.kind(127));
+    try std.testing.expectEqual(Kind.kda, c.kind(0));
+    inline for (.{
+        "[]",
+        "{\"text_config\": 1}",
+        "{\"num_hidden_layers\": -1}",
+        "{\"num_hidden_layers\": 4294967296}",
+        "{\"hidden_size\": \"7168\"}",
+        "{\"rms_norm_eps\": \"x\"}",
+        "{\"moe_intermediate_size\": 100000, \"num_shared_experts\": 100000}",
+        "{\"linear_attn_config\": []}",
+        "{\"linear_attn_config\": {\"head_dim\": 4, \"short_conv_kernel_size\": 4, \"full_attn_layers\": []}}",
+        "{\"linear_attn_config\": {\"num_heads\": 2, \"head_dim\": 4, \"short_conv_kernel_size\": 4, \"gate_lower_bound\": true, \"full_attn_layers\": []}}",
+        "{\"linear_attn_config\": {\"num_heads\": 2, \"head_dim\": 4, \"short_conv_kernel_size\": 4, \"full_attn_layers\": 3}}",
+        "{\"linear_attn_config\": {\"num_heads\": 2, \"head_dim\": 4, \"short_conv_kernel_size\": 4, \"full_attn_layers\": [0]}}",
+        "{\"linear_attn_config\": {\"num_heads\": 2, \"head_dim\": 4, \"short_conv_kernel_size\": 4, \"full_attn_layers\": [129]}}",
+    }) |json| try std.testing.expectError(error.BadConfig, parse(a, json));
 }
