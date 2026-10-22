@@ -79,15 +79,18 @@ pub fn frameKey(images: []const lanes.stream.Image) u32 {
 /// get_rope_index's positions below the last image's end, shifted so the text after it rotates at its own slot.
 pub fn frame(gpa: std.mem.Allocator, spans: []const Span) ![]i32 {
     if (spans.len == 0) return &.{};
-    const last = spans[spans.len - 1];
-    const end: usize = @as(usize, last.at) + last.n;
+    // every span in order and on its grid before a slot is written: the frame then ends at the last span's end
+    var end: usize = 0;
+    for (spans) |s| {
+        if (s.at < end or s.n != @as(u64, s.mh) * s.mw) return error.BadImageSpans;
+        end = @as(usize, s.at) + s.n;
+    }
     const shift = shiftOf(spans);
     const out = try gpa.alloc(i32, end * 3);
     errdefer gpa.free(out);
     var cur: i64 = 0; // transformers' current_pos
     var slot: usize = 0;
     for (spans) |s| {
-        if (s.at < slot or s.n != s.mh * s.mw) return error.BadImageSpans;
         while (slot < s.at) : (slot += 1) {
             @memset(out[slot * 3 ..][0..3], @intCast(cur + shift));
             cur += 1;
@@ -132,6 +135,8 @@ test "two images: each starts where transformers' running position left the text
     try std.testing.expectEqualSlices(i32, &.{ 5, 5, 5, 6, 6, 6 }, p[15..21]);
     try std.testing.expectEqualSlices(i32, &.{ 7, 7, 7, 7, 7, 8 }, p[21..27]);
     try std.testing.expectError(error.BadImageSpans, frame(a, &.{.{ .at = 0, .n = 5, .mh = 2, .mw = 2, .row = 0 }}));
+    // a later span that starts inside an earlier one is refused before the earlier one writes past the frame
+    try std.testing.expectError(error.BadImageSpans, frame(a, &.{ .{ .at = 8, .n = 4, .mh = 2, .mw = 2, .row = 0 }, .{ .at = 5, .n = 1, .mh = 1, .mw = 1, .row = 4 } }));
 }
 
 test "the frame key: the shift, so one image set's states fit only its own frame" {
