@@ -123,7 +123,20 @@ pub fn discover(a: Allocator, r: Runner, c: config.Config) !struct { config: con
 pub fn nodeCommand(a: Allocator, json: []const u8, name: []const u8, leader: []const u8, model: []const u8) ![]const u8 {
     const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(json.len));
     _ = std.base64.standard.Encoder.encode(b64, json);
-    return std.fmt.allocPrint(a, "mkdir -p ~/.config/tensorfold ~/.cache/tensorfold && printf %s {s} | base64 --decode > ~/.config/tensorfold/cluster.json && nohup tensorfold node --name {s} --leader {s} --model {s} --cluster ~/.config/tensorfold/cluster.json >> ~/.cache/tensorfold/node.log 2>&1 < /dev/null & echo started $!", .{ b64, name, leader, model });
+    return std.fmt.allocPrint(a, "mkdir -p ~/.config/tensorfold ~/.cache/tensorfold && printf %s {s} | base64 --decode > ~/.config/tensorfold/cluster.json && nohup tensorfold node --name {s} --leader {s} --model {s} --cluster ~/.config/tensorfold/cluster.json >> ~/.cache/tensorfold/node.log 2>&1 < /dev/null & echo started $!", .{ b64, try shellWord(a, name), try shellWord(a, leader), try shellWord(a, model) });
+}
+
+/// `s` as one word of the remote shell: as it is when every byte is plain, else single-quoted.
+pub fn shellWord(a: Allocator, s: []const u8) ![]const u8 {
+    const plain = for (s) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, "_-./:@%+=,", ch) == null) break false;
+    } else s.len > 0;
+    if (plain) return s;
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '\'');
+    for (s) |ch| if (ch == '\'') try out.appendSlice(a, "'\\''") else try out.append(a, ch);
+    try out.append(a, '\'');
+    return out.items;
 }
 
 pub const Started = struct { name: []const u8, argv: []const []const u8, ok: bool };

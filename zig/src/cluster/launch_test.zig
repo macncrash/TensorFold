@@ -98,3 +98,15 @@ test "serve starts tensorfold node on every other model node, reports a node tha
     _ = try launch.launch(a, fake.runner(), c, four, c.model("m").?, "n0", true);
     try std.testing.expectEqual(calls, fake.calls.items.len);
 }
+
+test "a model id the shell would read as more than a word goes to the node quoted" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("Qwen/Qwen3.5-27B", try launch.shellWord(a, "Qwen/Qwen3.5-27B"));
+    try std.testing.expectEqualStrings("''", try launch.shellWord(a, ""));
+    try std.testing.expectEqualStrings("'m; touch /tmp/x #'", try launch.shellWord(a, "m; touch /tmp/x #"));
+    try std.testing.expectEqualStrings("'it'\\''s $(id)'", try launch.shellWord(a, "it's $(id)"));
+    const cmd = try launch.nodeCommand(a, "{}", "n1", "n0", "m $(id)");
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "--name n1 --leader n0 --model 'm $(id)' --cluster") != null);
+}
