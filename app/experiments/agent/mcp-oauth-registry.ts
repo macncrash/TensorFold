@@ -44,11 +44,22 @@ export function base64UrlEncode(bytes: Uint8Array): string {
 }
 
 /**
+ * A uniform [0,1) from the platform CSPRNG (WebCrypto `getRandomValues`, present in Node ≥ 19,
+ * Electron and browsers). The PKCE verifier is the flow's only secret, so its default source must
+ * not be `Math.random`, whose state is recoverable from its outputs.
+ */
+export function secureRandom(): number {
+  const word = new Uint32Array(1)
+  globalThis.crypto.getRandomValues(word)
+  return word[0] / 0x1_0000_0000
+}
+
+/**
  * Generate a PKCE `code_verifier`: a high-entropy string of 43–128 chars from the unreserved
- * set (RFC 7636 §4.1). `random` is injectable (default `Math.random`) so tests are deterministic;
+ * set (RFC 7636 §4.1). `random` is injectable (default `secureRandom`) so tests are deterministic;
  * `length` defaults to 64 and is clamped to the legal [43,128] range.
  */
-export function generateCodeVerifier(random: () => number = Math.random, length = 64): string {
+export function generateCodeVerifier(random: () => number = secureRandom, length = 64): string {
   const n = Math.min(128, Math.max(43, Math.floor(length)))
   let out = ''
   for (let i = 0; i < n; i++) {
@@ -86,7 +97,7 @@ export async function deriveCodeChallenge(verifier: string): Promise<string> {
 }
 
 /** Convenience: generate a fresh verifier + its S256 challenge in one call. */
-export async function createPkcePair(random: () => number = Math.random, length = 64): Promise<PkcePair> {
+export async function createPkcePair(random: () => number = secureRandom, length = 64): Promise<PkcePair> {
   const verifier = generateCodeVerifier(random, length)
   const challenge = await deriveCodeChallenge(verifier)
   return { verifier, challenge, method: 'S256' }
