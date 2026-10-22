@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   base64UrlEncode,
   generateCodeVerifier,
+  secureRandom,
   deriveCodeChallenge,
   createPkcePair,
   authServerMetadataUrl,
@@ -53,6 +54,27 @@ function seq(values: number[]): () => number {
   const b = generateCodeVerifier(seq([0.1, 0.5, 0.9]))
   assert.equal(a, b)
   ok('generateCodeVerifier: 43–128 unreserved chars, deterministic under injected random')
+}
+
+// ---- PKCE default random source is the CSPRNG, not Math.random ----
+{
+  const real = Math.random
+  Math.random = () => { throw new Error('Math.random used for a PKCE verifier') }
+  try {
+    const v = generateCodeVerifier()
+    assert.equal(v.length, 64)
+    assert.match(v, /^[A-Za-z0-9\-._~]+$/)
+    assert.notEqual(generateCodeVerifier(), v)
+    const pair = await createPkcePair()
+    assert.equal(pair.challenge, await deriveCodeChallenge(pair.verifier))
+  } finally {
+    Math.random = real
+  }
+  for (let i = 0; i < 1000; i++) {
+    const r = secureRandom()
+    assert.ok(r >= 0 && r < 1)
+  }
+  ok('generateCodeVerifier / createPkcePair: default to WebCrypto, never Math.random')
 }
 
 // ---- PKCE S256 challenge (known RFC 7636 Appendix B test vector) ----
